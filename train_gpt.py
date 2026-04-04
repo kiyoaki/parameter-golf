@@ -56,6 +56,7 @@ class Hyperparameters:
     warmup_steps = int(os.environ.get("WARMUP_STEPS", 20))
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
+    eval_stride = int(os.environ.get("EVAL_STRIDE", str(train_seq_len)))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
     qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
 
@@ -66,6 +67,8 @@ class Hyperparameters:
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
+    mlp_activation = os.environ.get("MLP_ACTIVATION", "relu2")
+    leaky_relu_negative_slope = float(os.environ.get("LEAKY_RELU_NEGATIVE_SLOPE", 0.5))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
@@ -238,33 +241,74 @@ def eval_val(
             f"got VAL_BATCH_SIZE={args.val_batch_size}, WORLD_SIZE={world_size}, "
             f"GRAD_ACCUM_STEPS={grad_accum_steps}, TRAIN_SEQ_LEN={args.train_seq_len}"
         )
+    if args.eval_stride <= 0 or args.eval_stride > args.train_seq_len:
+        raise ValueError(
+            f"EVAL_STRIDE must be in [1, TRAIN_SEQ_LEN], got EVAL_STRIDE={args.eval_stride} "
+            f"TRAIN_SEQ_LEN={args.train_seq_len}"
+        )
+    if args.train_seq_len % args.eval_stride != 0:
+        raise ValueError(
+            f"TRAIN_SEQ_LEN={args.train_seq_len} must be divisible by EVAL_STRIDE={args.eval_stride}"
+        )
     local_batch_seqs = local_batch_tokens // args.train_seq_len
-    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
-    seq_start = (total_seqs * rank) // world_size
-    seq_end = (total_seqs * (rank + 1)) // world_size
     val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
     val_token_count = torch.zeros((), device=device, dtype=torch.float64)
     val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
 
     model.eval()
     with torch.inference_mode():
-        for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
-            batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
-            raw_start = batch_seq_start * args.train_seq_len
-            raw_end = batch_seq_end * args.train_seq_len + 1
-            local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
-            x = local[:-1].reshape(-1, args.train_seq_len)
-            y = local[1:].reshape(-1, args.train_seq_len)
-            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
-                batch_loss = model(x, y).detach()
-            batch_token_count = float(y.numel())
-            val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
-            val_token_count += batch_token_count
-            prev_ids = x.reshape(-1)
-            tgt_ids = y.reshape(-1)
-            token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
-            token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
-            val_byte_count += token_bytes.to(torch.float64).sum()
+        if args.eval_stride == args.train_seq_len:
+            total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+            seq_start = (total_seqs * rank) // world_size
+            seq_end = (total_seqs * (rank + 1)) // world_size
+            for batch_seq_start in range(seq_start, seq_end, local_batch_seqs):
+                batch_seq_end = min(batch_seq_start + local_batch_seqs, seq_end)
+                raw_start = batch_seq_start * args.train_seq_len
+                raw_end = batch_seq_end * args.train_seq_len + 1
+                local = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+                x = local[:-1].reshape(-1, args.train_seq_len)
+                y = local[1:].reshape(-1, args.train_seq_len)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    batch_loss = model(x, y).detach()
+                batch_token_count = float(y.numel())
+                val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
+                val_token_count += batch_token_count
+                prev_ids = x.reshape(-1)
+                tgt_ids = y.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
+        else:
+            total_tokens = val_tokens.numel() - 1
+            total_windows = 1 + (total_tokens - args.train_seq_len) // args.eval_stride
+            window_start = (total_windows * rank) // world_size
+            window_end = (total_windows * (rank + 1)) // world_size
+            for batch_window_start in range(window_start, window_end, local_batch_seqs):
+                batch_window_end = min(batch_window_start + local_batch_seqs, window_end)
+                x_list: list[Tensor] = []
+                y_list: list[Tensor] = []
+                mask_list: list[Tensor] = []
+                for window_idx in range(batch_window_start, batch_window_end):
+                    raw_start = window_idx * args.eval_stride
+                    local = val_tokens[raw_start : raw_start + args.train_seq_len + 1]
+                    x_list.append(local[:-1])
+                    y_list.append(local[1:])
+                    valid_from = 0 if window_idx == 0 else args.train_seq_len - args.eval_stride
+                    mask = torch.zeros((args.train_seq_len,), dtype=torch.bool)
+                    mask[valid_from:] = True
+                    mask_list.append(mask)
+                x = torch.stack(x_list).to(device=device, dtype=torch.int64, non_blocking=True)
+                y = torch.stack(y_list).to(device=device, dtype=torch.int64, non_blocking=True)
+                token_mask = torch.stack(mask_list).to(device=device, non_blocking=True)
+                with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                    token_losses = model(x, y, reduction="none").detach()
+                val_loss_sum += token_losses[token_mask].to(torch.float64).sum()
+                val_token_count += float(token_mask.sum().item())
+                prev_ids = x[token_mask]
+                tgt_ids = y[token_mask]
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+                token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+                val_byte_count += token_bytes.to(torch.float64).sum()
 
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
@@ -605,15 +649,23 @@ class CausalSelfAttention(nn.Module):
 
 class MLP(nn.Module):
     # relu^2 MLP from the original modded-nanogpt setup
-    def __init__(self, dim: int, mlp_mult: int):
+    def __init__(self, dim: int, mlp_mult: int, activation: str, leaky_relu_negative_slope: float):
         super().__init__()
         hidden = mlp_mult * dim
         self.fc = CastedLinear(dim, hidden, bias=False)
         self.proj = CastedLinear(hidden, dim, bias=False)
         self.proj._zero_init = True
+        self.activation = activation
+        self.leaky_relu_negative_slope = leaky_relu_negative_slope
 
     def forward(self, x: Tensor) -> Tensor:
-        x = torch.relu(self.fc(x))
+        x = self.fc(x)
+        if self.activation == "relu2":
+            x = torch.relu(x)
+        elif self.activation == "leaky_relu2":
+            x = F.leaky_relu(x, negative_slope=self.leaky_relu_negative_slope)
+        else:
+            raise ValueError(f"Unsupported MLP_ACTIVATION={self.activation}")
         return self.proj(x.square())
 
 
@@ -626,12 +678,14 @@ class Block(nn.Module):
         mlp_mult: int,
         rope_base: float,
         qk_gain_init: float,
+        mlp_activation: str,
+        leaky_relu_negative_slope: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
-        self.mlp = MLP(dim, mlp_mult)
+        self.mlp = MLP(dim, mlp_mult, mlp_activation, leaky_relu_negative_slope)
         self.attn_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.ones(dim, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
@@ -659,6 +713,8 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         qk_gain_init: float,
+        mlp_activation: str,
+        leaky_relu_negative_slope: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -680,6 +736,8 @@ class GPT(nn.Module):
                     mlp_mult,
                     rope_base,
                     qk_gain_init,
+                    mlp_activation,
+                    leaky_relu_negative_slope,
                 )
                 for i in range(num_layers)
             ]
@@ -697,7 +755,7 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "_zero_init", False):
                 nn.init.zeros_(module.weight)
 
-    def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
+    def _compute_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         x = F.rms_norm(x, (x.size(-1),))
         x0 = x
@@ -713,15 +771,23 @@ class GPT(nn.Module):
             x = self.blocks[self.num_encoder_layers + i](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
-        targets = target_ids.reshape(-1)
         if self.tie_embeddings:
             logits_proj = F.linear(x, self.tok_emb.weight)
         else:
             if self.lm_head is None:
                 raise RuntimeError("lm_head is required when tie_embeddings=False")
             logits_proj = self.lm_head(x)
-        logits = self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
-        return F.cross_entropy(logits.float(), targets, reduction="mean")
+        return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
+
+    def forward(self, input_ids: Tensor, target_ids: Tensor, reduction: str = "mean") -> Tensor:
+        logits = self._compute_logits(input_ids)
+        targets = target_ids.reshape(-1)
+        losses = F.cross_entropy(logits.float(), targets, reduction="none")
+        if reduction == "none":
+            return losses.view_as(target_ids)
+        if reduction == "mean":
+            return losses.mean()
+        raise ValueError(f"Unsupported reduction={reduction}")
 
 
 # -----------------------------
@@ -818,6 +884,10 @@ def main() -> None:
     log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
+    log0(
+        f"ablation_config: mlp_activation={args.mlp_activation} "
+        f"leaky_relu_negative_slope={args.leaky_relu_negative_slope} eval_stride={args.eval_stride}"
+    )
 
     # -----------------------------
     # MODEL + OPTIMIZER SETUP
@@ -835,6 +905,8 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         qk_gain_init=args.qk_gain_init,
+        mlp_activation=args.mlp_activation,
+        leaky_relu_negative_slope=args.leaky_relu_negative_slope,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
