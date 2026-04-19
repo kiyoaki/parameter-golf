@@ -385,17 +385,13 @@ def train_model(h,device,val_data):
 		if h.warmdown_frac<=0:return 1.
 		if frac>=1.-h.warmdown_frac:return max((1.-frac)/h.warmdown_frac,h.min_lr)
 		return 1.
-	def step_fn(step,lr_scale,qni_scale=.0):
+	def step_fn(step,lr_scale):
 		optimizers.zero_grad_all();train_loss=torch.zeros((),device=device)
 		for micro_step in range(h.grad_accum_steps):
 			if h.distributed:model.require_backward_grad_sync=micro_step==h.grad_accum_steps-1
 			x,y=train_loader.next_batch(h.train_batch_tokens,h.grad_accum_steps)
-			noises=apply_qni_(qni_targets,qni_scale)
-			try:
-				with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
-				train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
-			finally:
-				if noises:revert_qni_(noises)
+			with torch.autocast(device_type='cuda',dtype=torch.bfloat16,enabled=True):loss=model(x,y)
+			train_loss+=loss.detach();(loss/h.grad_accum_steps).backward()
 		train_loss/=h.grad_accum_steps;frac=min(step/h.muon_momentum_warmup_steps,1.)if h.muon_momentum_warmup_steps>0 else 1.;muon_momentum=(1-frac)*h.muon_momentum_warmup_start+frac*h.muon_momentum
 		for group in optimizers.optimizer_muon.param_groups:group['momentum']=muon_momentum
 		for opt in optimizers:
@@ -428,7 +424,10 @@ def train_model(h,device,val_data):
 		elapsed_ms=training_time_ms+1e3*(time.perf_counter()-t0);frac=training_frac(step,elapsed_ms);scale=lr_mul(frac);qni_scale=h.qni_amplitude*qni_schedule_value(h,frac) if h.qni_enabled else .0
 		if h.num_loops>0 and not base_model.looping_active and frac>=h.enable_looping_at:base_model.looping_active=True;log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 		if h.qni_enabled and qni_scale>0. and not qni_started:qni_started=True;log(f"qni:enabled step:{step} frac:{frac:.3f} scale:{qni_scale:.4f}")
-		train_loss=step_fn(step,scale,qni_scale=qni_scale)
+		noises=apply_qni_(qni_targets,qni_scale)
+		try:train_loss=step_fn(step,scale)
+		finally:
+			if noises:revert_qni_(noises)
 		with torch.no_grad():
 			for(name,t)in base_model.state_dict().items():ema_state[name].mul_(ema_decay).add_(t.detach().float(),alpha=1.-ema_decay)
 		step+=1;approx_training_time_ms=training_time_ms+1e3*(time.perf_counter()-t0);should_log_train=h.train_log_every>0 and(step<=5 or step%h.train_log_every==0 or stop_after_step is not None)
