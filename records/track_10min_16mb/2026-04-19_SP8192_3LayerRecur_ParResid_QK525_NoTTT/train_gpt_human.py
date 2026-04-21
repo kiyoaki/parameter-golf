@@ -159,37 +159,19 @@ def classify_param(name):
 	if'.mlp.'in name:return'mlp'
 	if'.attn.'in name or'.proj.'in name and'.mlp.'not in name:return'attn'
 	return'other'
-def classify_qni_family(name):
-	if'tok_emb'in name or'lm_head'in name or'embed_proj'in name or'head_proj'in name:return'embed'
-	return classify_param(name)
-def qni_schedule_value(h,frac):
-	if frac<h.qni_onset_frac:return 0.
-	pos=min(max((frac-h.qni_onset_frac)/max(1.-h.qni_onset_frac,1e-09),0.),1.)
-	if h.qni_schedule=='constant':return 1.
-	if h.qni_schedule=='linear_ramp':return pos
-	if h.qni_schedule=='triangle':return 1.-abs(2.*pos-1.)
-	raise ValueError(f"Unknown QNI_SCHEDULE: {h.qni_schedule!r}")
 def build_qni_targets(model,h):
 	if not h.qni_enabled:return[]
-	families={name.strip()for name in h.qni_families.split(',')if name.strip()};valid={'mlp','attn','embed'};invalid=families-valid
-	if invalid:raise ValueError(f"Unknown QNI_FAMILIES entries: {sorted(invalid)}")
-	if not families:raise ValueError('QNI_ENABLED=1 requires at least one QNI_FAMILIES entry')
-	if h.qni_schedule not in('constant','linear_ramp','triangle'):raise ValueError(f"Unknown QNI_SCHEDULE: {h.qni_schedule!r}")
-	targets=[];counts=collections.Counter();sigma_means=collections.defaultdict(list)
+	families=h.qni_families;targets=[]
 	for(name,param)in model.named_parameters():
 		if param.ndim!=2:continue
-		family=classify_qni_family(name)
+		family=classify_param(name)
 		if family not in families:continue
-		sigma=param.detach().float().std(dim=1,keepdim=True).clamp_min(1e-08).to(dtype=param.dtype);targets.append((param,sigma,family));counts[family]+=1;sigma_means[family].append(float(sigma.float().mean().item()))
-	if h.is_main_process and targets:
-		log(f"qni_targets: {sum(counts.values())}")
-		for family in sorted(counts):log(f"  qni_{family}: count={counts[family]} sigma={sum(sigma_means[family])/len(sigma_means[family]):.4e}")
+		targets.append((param,param.detach().float().std(dim=1,keepdim=True).clamp_min(1e-08).to(dtype=param.dtype)))
 	return targets
 @torch.no_grad()
 def apply_qni_(targets,scale):
-	if scale<=0.:return[]
 	noises=[]
-	for(param,sigma,_)in targets:
+	for(param,sigma)in targets:
 		noise=torch.randn_like(param)*sigma*scale;param.add_(noise);noises.append((param,noise))
 	return noises
 @torch.no_grad()
@@ -415,16 +397,15 @@ def train_model(h,device,val_data):
 		optimizers.zero_grad_all()
 		if h.distributed:model.require_backward_grad_sync=True
 		train_loader=ShuffledSequenceLoader(h,device)
-	ema_state={name:t.detach().float().clone()for(name,t)in base_model.state_dict().items()};ema_decay=h.ema_decay;training_time_ms=.0;stop_after_step=None;qni_started=False;torch.cuda.synchronize();t0=time.perf_counter();step=0
+	ema_state={name:t.detach().float().clone()for(name,t)in base_model.state_dict().items()};ema_decay=h.ema_decay;training_time_ms=.0;stop_after_step=None;torch.cuda.synchronize();t0=time.perf_counter();step=0
 	while True:
 		last_step=step==h.iterations or stop_after_step is not None and step>=stop_after_step;should_validate=last_step or h.val_loss_every>0 and step%h.val_loss_every==0
 		if should_validate:torch.cuda.synchronize();training_time_ms+=1e3*(time.perf_counter()-t0);val_loss,val_bpb=eval_val(h,device,val_data,model);log(f"{step}/{h.iterations} val_loss: {val_loss:.4f} val_bpb: {val_bpb:.4f}");torch.cuda.synchronize();t0=time.perf_counter()
 		if last_step:
 			if stop_after_step is not None and step<h.iterations:log(f"stopping_early: wallclock_cap train_time: {training_time_ms:.0f}ms step: {step}/{h.iterations}")
 			break
-		elapsed_ms=training_time_ms+1e3*(time.perf_counter()-t0);frac=training_frac(step,elapsed_ms);scale=lr_mul(frac);qni_scale=h.qni_amplitude*qni_schedule_value(h,frac) if h.qni_enabled else .0
+		elapsed_ms=training_time_ms+1e3*(time.perf_counter()-t0);frac=training_frac(step,elapsed_ms);scale=lr_mul(frac);qni_scale=h.qni_amplitude if h.qni_enabled and frac>=h.qni_onset_frac else .0
 		if h.num_loops>0 and not base_model.looping_active and frac>=h.enable_looping_at:base_model.looping_active=True;log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
-		if h.qni_enabled and qni_scale>0. and not qni_started:qni_started=True;log(f"qni:enabled step:{step} frac:{frac:.3f} scale:{qni_scale:.4f}")
 		if qni_scale>0.:
 			noises=apply_qni_(qni_targets,qni_scale)
 			try:train_loss=step_fn(step,scale)
