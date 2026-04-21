@@ -425,10 +425,11 @@ def train_model(h,device,val_data):
 		elapsed_ms=training_time_ms+1e3*(time.perf_counter()-t0);frac=training_frac(step,elapsed_ms);scale=lr_mul(frac);qni_scale=h.qni_amplitude*qni_schedule_value(h,frac) if h.qni_enabled else .0
 		if h.num_loops>0 and not base_model.looping_active and frac>=h.enable_looping_at:base_model.looping_active=True;log(f"layer_loop:enabled step:{step} frac:{frac:.3f} encoder:{base_model.encoder_indices} decoder:{base_model.decoder_indices}")
 		if h.qni_enabled and qni_scale>0. and not qni_started:qni_started=True;log(f"qni:enabled step:{step} frac:{frac:.3f} scale:{qni_scale:.4f}")
-		noises=apply_qni_(qni_targets,qni_scale)
-		try:train_loss=step_fn(step,scale)
-		finally:
-			if noises:revert_qni_(noises)
+		if qni_scale>0.:
+			noises=apply_qni_(qni_targets,qni_scale)
+			try:train_loss=step_fn(step,scale)
+			finally:revert_qni_(noises)
+		else:train_loss=step_fn(step,scale)
 		with torch.no_grad():
 			for(name,t)in base_model.state_dict().items():ema_state[name].mul_(ema_decay).add_(t.detach().float(),alpha=1.-ema_decay)
 		step+=1;approx_training_time_ms=training_time_ms+1e3*(time.perf_counter()-t0);should_log_train=h.train_log_every>0 and(step<=5 or step%h.train_log_every==0 or stop_after_step is not None)
